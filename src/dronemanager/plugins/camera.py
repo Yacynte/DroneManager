@@ -128,7 +128,7 @@ class CameraPlugin(Plugin):
 
 def _xml_cache_filepath(uri, version):
     pathsafe_uri = uri.replace("/", "_").replace("\\", "_").replace(":", "_").replace("?", "_").replace("\n", "")
-    filename = f"{version}_{pathsafe_uri}.xml"
+    filename = f"{version}_{pathsafe_uri}"
     cache_dir = CACHE_DIR.joinpath("camera_definitions")
     return cache_dir.joinpath(filename)
 
@@ -359,7 +359,7 @@ class Camera:
             if cached_path.exists():
                 xml_str = await asyncio.get_running_loop().run_in_executor(None, self._load_xml, uri, version)
             else:
-                self.logger.debug("Camera definition file not cached, downloading...")
+                self.logger.debug(f"Camera definition file not cached, downloading from {uri}")
                 xml_str = await asyncio.get_running_loop().run_in_executor(None, self._download_xml, uri)
                 if xml_str:
                     await asyncio.get_running_loop().run_in_executor(None, self._save_xml, xml_str, uri, version)
@@ -380,7 +380,7 @@ class Camera:
         filepath = _xml_cache_filepath(uri, version)
         self.logger.debug(f"Saving camera definition xml {filepath}")
         os.makedirs(filepath.parent, exist_ok=True)
-        with open(filepath, "wt", encoding="utf-8") as f:
+        with open(filepath, "wb") as f:
             f.write(xml_str)
 
     def _load_xml(self, uri, version):
@@ -449,7 +449,7 @@ class Camera:
                                                         options=options, min_value=min_val, max_value=max_val,
                                                         step_size=step_size)
         except Exception as e:
-            self.logger.warning("Couldn't parse the parameter XML")
+            self.logger.warning("Couldn't parse the parameter XML! See the logs for more details, and check the XML file.")
             self.logger.debug(repr(e), exc_info=True)
 
     def _get_cam_params(self):
