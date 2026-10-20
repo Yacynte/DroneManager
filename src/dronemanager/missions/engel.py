@@ -160,6 +160,7 @@ class ENGELDataMission(Mission):
         self.captures: list[ENGELCaptureInfo] = []  # Images taken this session
         self.loaded_captures: list[ENGELCaptureInfo] = []  # Images taken during a previous session, intended to be replayed
         self.loaded_file: str | None = None
+        self.replay_idx: int | None = None  # Index in loaded_captures of the capture currently being replayed
         self._current_capture: ENGELCaptureInfo | None = None
 
         # Due to drone motion, we might have to move beyond gimbal limits during replay, leading to a deadlock. These
@@ -412,12 +413,19 @@ class ENGELDataMission(Mission):
         # For each loaded capture: Set camera parameters, fly to position, optionally refine position, take new capture
         # Currently just prints loaded info for debug purposes
         if idx is None:
-            captures = self.loaded_captures
+            captures = list(enumerate(self.loaded_captures))
         else:
-            captures = [self.loaded_captures[idx]]
+            captures = [(idx, self.loaded_captures[idx])]
         drone = self.drones[self.drone_name]
-        for capture in captures:
+        try:
+            await self._replay_capture_list(drone, captures)
+        finally:
+            self.replay_idx = None
+
+    async def _replay_capture_list(self, drone, captures: list[tuple[int, ENGELCaptureInfo]]):
+        for capture_idx, capture in captures:
             try:
+                self.replay_idx = capture_idx  # So test-init can pick the matching target image
                 self.refining = self.do_refining
                 reference_image = _reference_image(capture)
 
@@ -831,9 +839,13 @@ class ENGELDataMission(Mission):
         imgWidth: int - The width of the image frames to be used for position correction.
         capture_idx: int - Index of a capture in the loaded capture file. If set, its reference image is used as
             target image instead of target_image, looked up by file name in target_dir on the host machine.
+            If not set while a replay is running, the index of the capture being replayed is used.
         target_dir: str - The folder on the host machine holding the reference images, used with capture_idx.
 
         '''
+        if capture_idx is None and self.replay_idx is not None:
+            capture_idx = self.replay_idx
+            self.logger.info(f"Using index {capture_idx} of the running replay.")
         if capture_idx is not None:
             if not self.loaded_captures:
                 self.logger.warning("No captures loaded, load a capture file before using capture_idx!")
