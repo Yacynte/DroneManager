@@ -7,6 +7,8 @@ import csv
 import logging
 import math
 import pathlib
+import posixpath
+import stat
 from asyncio import StreamReader, StreamWriter
 from collections.abc import Callable
 import socket
@@ -135,6 +137,7 @@ class ENGELDataMission(Mission):
             "test-command": self.test_command,
             "test-stop": self.stop_test_send,
             "test-send-target-images": self.test_send_target_images,
+            "ssh-copy": self.ssh_copy,
             "test-close": self.close_test,
             "test-rates": self.rate_test,
             "test-log-start": self.open_motion_log,
@@ -416,11 +419,7 @@ class ENGELDataMission(Mission):
         for capture in captures:
             try:
                 self.refining = self.do_refining
-                reference_image = capture.images[0]
-                # Use "visible" as reference image for now. TODO: Figure out if this is best, might have to do screenshots if comparison happens against live feed
-                for image in capture.images:
-                    if "visible" in image.file_location:
-                        reference_image = image
+                reference_image = _reference_image(capture)
 
                 # Set camera parameters
                 cam_set_task = asyncio.create_task(self.set_camera_parameters(capture.camera_parameters))
@@ -467,6 +466,7 @@ class ENGELDataMission(Mission):
                 # await asyncio.sleep(3)
                 # Refine position and gimbal attitude based on previous image
                 self.logger.info("Reached coarse position, handing over to refining Algo.")
+                await self._hand_over_to_correction()
                 while self.refining:
                     await asyncio.sleep(0.1)
 
@@ -807,11 +807,12 @@ class ENGELDataMission(Mission):
                 self.logger.warning(f"Couldn't send target images due to an exception: {repr(e)}")
                 self.logger.debug(repr(e), exc_info=True)
 
-    async def init_test(self, ip: str = "172.18.164.120",  data_port: int = 9020, binary: str = "build/ImageMatcher", 
+    async def init_test(self, ip: str = "192.168.0.10",  data_port: int = 9020, binary: str = "build/ImageMatcher", 
                         target_image: str = "controls/imagesGT1/GT1_Capture_20260629_153019.png", 
                         mode: str = "live", stream: str|None = "tcp://10.116.88.38:9000",
                         method: str = "ssh", ssh_user: str ="dronetrekkers", ssh_password: str|None = None,
                         imgHeight: int= 1080, imgWidth:int = 1920, simulation: int = 0, #ssh_ip:str = "127.0.0.1"
+                        capture_idx: int | None = None, target_dir: str = "targets",
                         ):
         '''
         Initializes the position correction test by setting up the necessary components 
@@ -828,8 +829,25 @@ class ENGELDataMission(Mission):
         ssh_user: str - The username for SSH/WSL connection to the host machine.
         imgHeight: int - The height of the image frames to be used for position correction.
         imgWidth: int - The width of the image frames to be used for position correction.
+        capture_idx: int - Index of a capture in the loaded capture file. If set, its reference image is used as
+            target image instead of target_image, looked up by file name in target_dir on the host machine.
+        target_dir: str - The folder on the host machine holding the reference images, used with capture_idx.
 
         '''
+        if capture_idx is not None:
+            if not self.loaded_captures:
+                self.logger.warning("No captures loaded, load a capture file before using capture_idx!")
+                return
+            try:
+                capture = self.loaded_captures[capture_idx]
+            except IndexError:
+                self.logger.warning(f"Invalid capture index {capture_idx}, "
+                                    f"have {len(self.loaded_captures)} loaded captures.")
+                return
+            image_name = pathlib.PurePath(_reference_image(capture).file_location).name
+            target_image = posixpath.join(target_dir, image_name)
+            self.logger.info(f"Using reference image of capture {capture_idx} as target: {target_image}")
+
         home_dir="/home/user/drone_repositioning"
         if not ssh_user:
             ssh_user = None
@@ -853,6 +871,56 @@ class ENGELDataMission(Mission):
         if simulation:
             self.connect_simulation()
         self.logger.info("Setup for position correction test completed.")
+
+    async def ssh_copy(self, direction: str, local_path: str, remote_path: str, ip: str = "192.168.0.10",
+                       ssh_user: str = "dronetrekkers", ssh_password: str | None = None,
+                       home_dir: str = "/home/dronetrekkers/drone_repositioning"):
+        """ Copy files or folders to or from the position correction host over SSH.
+
+        inputs:
+        direction: str - "to" copies local_path to the host, "from" copies remote_path from the host.
+        local_path: str - File or folder on this machine.
+        remote_path: str - File or folder on the host. Relative paths are relative to home_dir.
+        ip: str - The IP address of the host machine.
+        ssh_user: str - The username for the SSH connection.
+        ssh_password: str - The password for the SSH connection.
+        home_dir: str - Base directory for relative remote paths.
+        If the target is an existing folder, the copied item is placed inside it, like scp -r.
+        """
+        if direction not in ("to", "from"):
+            self.logger.warning(f"Invalid direction {direction}, must be 'to' or 'from'")
+            return
+        if ssh_password is None:
+            self.logger.warning("No SSH password given, can't copy files.")
+            return
+        if not posixpath.isabs(remote_path):
+            remote_path = posixpath.join(home_dir, remote_path)
+        self.logger.info(f"Copying {'to' if direction == 'to' else 'from'} {ssh_user}@{ip}: "
+                         f"{local_path} {'->' if direction == 'to' else '<-'} {remote_path}")
+        try:
+            n_files = await asyncio.get_running_loop().run_in_executor(
+                None, self._sftp_copy, direction, pathlib.Path(local_path), remote_path, ip, ssh_user, ssh_password)
+            self.logger.info(f"Copied {n_files} file(s).")
+        except Exception as e:
+            self.logger.warning(f"Couldn't copy files over SSH: {repr(e)}")
+            self.logger.debug(repr(e), exc_info=True)
+
+    def _sftp_copy(self, direction: str, local_path: pathlib.Path, remote_path: str, host: str, user: str,
+                   password: str) -> int:
+        with paramiko.SSHClient() as client:
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(hostname=host, username=user, password=password)
+            with client.open_sftp() as sftp:
+                if direction == "to":
+                    if not local_path.exists():
+                        raise FileNotFoundError(f"Local path {local_path} doesn't exist")
+                    if _sftp_is_dir(sftp, remote_path):
+                        remote_path = posixpath.join(remote_path, local_path.name)
+                    return _sftp_put(sftp, local_path, remote_path)
+                else:
+                    if local_path.is_dir():
+                        local_path = local_path.joinpath(posixpath.basename(remote_path.rstrip("/")))
+                    return _sftp_get(sftp, remote_path, local_path)
 
     async def test_send_target_images(self, target_image: str = "controls/imagesGT1", remote_host: str = "192.168.0.10", 
                                  remote_user: str = "dronetrekkers", home_dir: str = "/home/user/drone_repositioning"):
@@ -911,7 +979,21 @@ class ENGELDataMission(Mission):
     async def connect_data(self, ip: str = "127.0.0.1", port: int = 9010):
         await self.correction_algo.connect_command_channel(ip, port)
         
+    async def _hand_over_to_correction(self):
+        """ Prepare the drone for velocity setpoints from the correction algorithm. """
+        if self.drone_name is None or self.drone_name not in self.dm.drones:
+            return
+        drone = self.dm.drones[self.drone_name]
+        # The path follower from fly_to keeps streaming position setpoints, which would fight the velocity
+        # setpoints from the correction algorithm and cause stop-and-go motion.
+        if drone.path_follower is not None and drone.path_follower.is_active:
+            self.logger.debug("Deactivating path follower for position correction")
+            await drone.path_follower.deactivate()
+        # Hold the current heading while correcting instead of yawing to north
+        self._reference_yaw = drone.attitude[2]
+
     async def start_test(self):
+        await self._hand_over_to_correction()
         self.correction_algo.start()
         if self._motion_log_writer is None:
             await self._open_motion_log()
@@ -967,6 +1049,43 @@ class ENGELDataMission(Mission):
 
 def _roll_pitch_compensation(gimbal_yaw, drone_roll, drone_pitch):
     return 0
+
+
+def _reference_image(capture: ENGELCaptureInfo) -> EngelImageInfo:
+    # Use "visible" as reference image for now. TODO: Figure out if this is best, might have to do screenshots if comparison happens against live feed
+    reference_image = capture.images[0]
+    for image in capture.images:
+        if "visible" in image.file_location:
+            reference_image = image
+    return reference_image
+
+
+def _sftp_is_dir(sftp: paramiko.SFTPClient, remote_path: str) -> bool:
+    try:
+        return stat.S_ISDIR(sftp.stat(remote_path).st_mode)
+    except FileNotFoundError:
+        return False
+
+
+def _sftp_put(sftp: paramiko.SFTPClient, local_path: pathlib.Path, remote_path: str) -> int:
+    """ Recursively upload a file or folder, returns the number of files copied. """
+    if local_path.is_dir():
+        if not _sftp_is_dir(sftp, remote_path):
+            sftp.mkdir(remote_path)
+        return sum(_sftp_put(sftp, child, posixpath.join(remote_path, child.name)) for child in local_path.iterdir())
+    sftp.put(str(local_path), remote_path)
+    return 1
+
+
+def _sftp_get(sftp: paramiko.SFTPClient, remote_path: str, local_path: pathlib.Path) -> int:
+    """ Recursively download a file or folder, returns the number of files copied. """
+    if _sftp_is_dir(sftp, remote_path):
+        local_path.mkdir(parents=True, exist_ok=True)
+        return sum(_sftp_get(sftp, posixpath.join(remote_path, entry.filename), local_path.joinpath(entry.filename))
+                   for entry in sftp.listdir_attr(remote_path))
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    sftp.get(remote_path, str(local_path))
+    return 1
 
 
 class PositionCorrectionHandler:
