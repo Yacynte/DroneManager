@@ -23,6 +23,7 @@ import os
 import shutil
 import shlex
 
+import random
 import paramiko
 
 from dronemanager.navigation.core import Waypoint, WayPointType
@@ -192,6 +193,8 @@ class ENGELDataMission(Mission):
         self._motion_log_writer = None
 
         self._reference_yaw = 0.0
+        self.use_displacement = False  # If True, move by integrated displacements instead of setting velocities
+        self.max_correction_step = 1.0  # Largest position step per integration window in meters, per axis
 
     def _get_motion_log_path(self, filename: str | None = None) -> pathlib.Path:
         if filename is None:
@@ -436,9 +439,7 @@ class ENGELDataMission(Mission):
                 # Have to reset gimbal position to drone-relative 0 to prevent running into gimbal limit
                 self.logger.debug("Resetting gimbal position to neutral.")
                 await self.gimbal.set_gimbal_mode("follow")
-                res = False
-                while not res:
-                    res = await self.gimbal.set_gimbal_angles(0.1, 0.1)
+                res = await self.gimbal.set_gimbal_angles(0.1, 0.1)
                 await asyncio.sleep(1.5)  # Sleep a little to allow gimbal to move
                 if drone.is_armed and drone.in_air:
                     # Fly to position
@@ -446,16 +447,18 @@ class ENGELDataMission(Mission):
                     await self.dm.fly_to(self.drone_name, gps=reference_image.gps, yaw=reference_image.drone_att[2])
 
                 # Move gimbal to the relative angle, should match absolute pretty close
+                val_p = random.randint(5, 15)
+                val_new_p = val_p if random.choice([True, False]) else - val_p
+                val_y = random.randint(5, 15)
+                val_new_y = val_y if random.choice([True, False]) else - val_y
+                target_pitch = reference_image.gimbal_att[1] + val_new_p
+                target_yaw = reference_image.gimbal_att[2] + val_new_y
+
                 self.logger.debug("Moving gimbal to approximate target position.")
                 await self.gimbal.set_gimbal_mode("follow")
-                res = False
-                while not res:
-                #     res = await self.gimbal.set_gimbal_angles(reference_image.gimbal_att[1], reference_image.gimbal_att[
-                #         2])  # Set a non-zero to make sure gimbal responds
-                # await asyncio.sleep(1.5)  # Short sleep so gimbal has time to physically move.
-                    res = await self.gimbal.set_gimbal_angles(reference_image.gimbal_att[1], reference_image.gimbal_att[2])  # Set a non-zero to make sure gimbal responds
+                res = await self.gimbal.set_gimbal_angles(target_pitch, target_yaw)  # Set a non-zero to make sure gimbal responds
                 # Wait for gimbal to have reached position.
-                while abs(self.gimbal.pitch - reference_image.gimbal_att[1]) > 1 or abs(self.gimbal.yaw - reference_image.gimbal_att[2]) > 1:
+                while abs(self.gimbal.pitch - target_pitch) > 2 or abs(self.gimbal.yaw - target_yaw) > 2:
                     await asyncio.sleep(0.1)
                 # Wait until camera parameters are set
                 await cam_set_task
@@ -733,6 +736,18 @@ class ENGELDataMission(Mission):
                 self.logger.debug(repr(e), exc_info = True)
             await asyncio.sleep(1/self._gimbal_frequency)
 
+    def _camera_to_ned(self, vector: np.ndarray) -> np.ndarray:
+        """ Rotate a vector from the camera frame (x forward, y right, z down) into NED using the camera yaw. """
+        camera_yaw = self.gimbal.yaw_absolute
+        if math.isnan(camera_yaw):
+            # No absolute yaw from the gimbal, use drone heading plus gimbal yaw relative to the drone instead
+            camera_yaw = self.dm.drones[self.drone_name].attitude[2] + self.gimbal.yaw
+        yaw = math.radians(camera_yaw)
+        forward, right, down = vector
+        north = forward * math.cos(yaw) - right * math.sin(yaw)
+        east = forward * math.sin(yaw) + right * math.cos(yaw)
+        return np.asarray([north, east, down])
+
     def correction_callback(self, parsed_message):
         if parsed_message :
             try:
@@ -748,8 +763,18 @@ class ENGELDataMission(Mission):
                 self.target_flag = parsed_message["target_flag"]
                 self.logger.info(f"Received message {parsed_message}")
 
+                if self.target_flag == -1:
+                    self.logger.info("Position correction target reached!")
+                    self.refining = False
+                    # Drone setpoint for current position
+                    final_wp = Waypoint(WayPointType.POS_NED, pos=drone_obj.position_ned, yaw=self._reference_yaw)
+                    asyncio.run_coroutine_threadsafe(drone_obj.set_setpoint(final_wp), self._loop)
+                    # Stop correction
+                    asyncio.run_coroutine_threadsafe(self.stop_test(), self._loop)
+                    # asyncio.run_coroutine_threadsafe(self.close_test(), self._loop)
+                    self.target_flag = 0
                 # self.logger.info(parsed_message)
-                translation_shift = translation / 100
+                translation_shift = self._camera_to_ned(translation / 100)
                 translation_shift = np.clip(translation_shift, -1, 1)  # Limit translation shift to prevent too aggressive movement
                 self.rotation_target = rotation_target
                 self.rotation_shift = rotation
@@ -762,19 +787,19 @@ class ENGELDataMission(Mission):
                 gimbal_task = asyncio.run_coroutine_threadsafe(self.gimbal.set_gimbal_rates(pitch_rate, yaw_rate), self._loop)
                 gimbal_awaiter_task = asyncio.run_coroutine_threadsafe(coroutine_awaiter(gimbal_task, self.logger), self._loop)
 
-                # Set velocity setpoint
                 drone_obj = self.dm.drones[self.drone_name]
-                target_vel_wp = Waypoint(WayPointType.VEL_NED, vel=translation_shift, yaw=self._reference_yaw)
-                asyncio.run_coroutine_threadsafe(drone_obj.set_setpoint(target_vel_wp), self._loop)
-                if self.target_flag == -1:
-                    self.logger.info("Position correction target reached!")
-                    self.refining = False
-                    # Drone setpoint for current position
-                    final_wp = Waypoint(WayPointType.POS_NED, pos=drone_obj.position_ned, yaw=self._reference_yaw)
-                    asyncio.run_coroutine_threadsafe(drone_obj.set_setpoint(final_wp), self._loop)
-                    # Stop correction
-                    asyncio.run_coroutine_threadsafe(self.stop_test(), self._loop)
-                    # asyncio.run_coroutine_threadsafe(self.close_test(), self._loop)
+                if not self.use_displacement:
+                    # Set velocity setpoint
+                    target_vel_wp = Waypoint(WayPointType.VEL_NED, vel=translation_shift, yaw=self._reference_yaw)
+                    asyncio.run_coroutine_threadsafe(drone_obj.set_setpoint(target_vel_wp), self._loop)
+                elif parsed_message["displacement"] is not None:
+                    # Once per integration window, move by the integrated displacement instead
+                    step = self._camera_to_ned(parsed_message["displacement"] / 100)
+                    step = np.clip(step, -self.max_correction_step, self.max_correction_step)  # Limit step to prevent too aggressive movement
+                    self.logger.info(f"Moving by {step} m")
+                    target_pos_wp = Waypoint(WayPointType.POS_NED, pos=drone_obj.position_ned + step, yaw=self._reference_yaw)
+                    asyncio.run_coroutine_threadsafe(drone_obj.set_setpoint(target_pos_wp), self._loop)
+                
             except Exception as e:
                 self.logger.warning("Exception forwarding position correction messages! See log for details")
                 self.logger.debug(repr(e), exc_info=True)
@@ -1005,7 +1030,7 @@ class ENGELDataMission(Mission):
         self._reference_yaw = drone.attitude[2]
 
     async def start_test(self):
-        await self._hand_over_to_correction()
+        # await self._hand_over_to_correction()
         self.correction_algo.start()
         if self._motion_log_writer is None:
             await self._open_motion_log()
@@ -1032,13 +1057,13 @@ class ENGELDataMission(Mission):
             await self._close_motion_log()
         if self.correction_algo is not None:
             await self.correction_algo.stop()
-        await self.destroy_test()
         if self.repositioning_task:
             self.repositioning_task.cancel()
             try:
                 await self.repositioning_task
             except asyncio.CancelledError:
                 pass
+        await self.destroy_test()
 
     async def close_test(self):
         if self.correction_algo is not None:
@@ -1115,6 +1140,8 @@ class PositionCorrectionHandler:
         self.message_ = None
         self.start_receiving = False
         self.proc = None
+        self.ssh_client: paramiko.SSHClient | None = None
+        self.pid = None
         self.running = False
         self.command_handler = CommandChannel()
         self.message_callback = None
@@ -1230,9 +1257,30 @@ class PositionCorrectionHandler:
                 await self.proc.wait()     # reap the zombie
             self.proc = None
             self.logger.info("Correction algorithm process closed.")
-        else:
+        elif self.ssh_client is not None:
             await asyncio.sleep(1)
-            self.ssh_client.exec_command(f"kill -TERM {self.pid}")
+            try:
+                if self.pid is not None:
+                    await self.loop.run_in_executor(None, self._kill_remote, self.pid)
+            except Exception as e:
+                self.logger.warning(f"Couldn't stop remote ImageMatcher: {repr(e)}")
+                self.logger.debug(repr(e), exc_info=True)
+            finally:
+                self.ssh_client.close()
+                self.ssh_client = None
+                self.pid = None
+
+    def _kill_remote(self, pid: int, timeout: float = 5):
+        """ SIGTERM the remote process, wait up to timeout seconds for it to exit, SIGKILL it if it didn't. """
+        tries = int(timeout / 0.1)
+        command = (f"kill -TERM {pid} 2>/dev/null; "
+                   f"for i in $(seq {tries}); do kill -0 {pid} 2>/dev/null || exit 0; sleep 0.1; done; "
+                   f"kill -KILL {pid}; exit 1")
+        _, stdout, _ = self.ssh_client.exec_command(command)
+        if stdout.channel.recv_exit_status() == 0:
+            self.logger.info(f"Remote ImageMatcher (PID {pid}) closed.")
+        else:
+            self.logger.warning(f"Remote ImageMatcher (PID {pid}) didn't exit after SIGTERM, killed it.")
 
     async def stop_send(self):
         self.logger.info("Closing correction algorithm...")
@@ -1256,7 +1304,7 @@ class PositionCorrectionHandler:
     def _data_thread(self):
         while self.running: # and not self.command_handler.arrived_at_target:
             try:
-                message = self.command_handler.get_from_queue()
+                message = self.command_handler.get_from_queue(timeout=0.2)
                 if message:
                     if self.command_handler.simulation:
                         # Clean the message (remove newlines and extra whitespace)
@@ -1330,6 +1378,11 @@ class CommandChannel():
                 'target': "gimbal",
                 'target_flag': 0
             }
+        # Translation velocities are buffered and integrated over a window to get a displacement
+        self.integration_window = 1.5  # Seconds of velocity samples per displacement
+        self.max_sample_gap = 0.5  # If two samples are further apart than this (s), the window is restarted
+        self._vel_times: list[float] = []
+        self._vel_samples: list[np.ndarray] = []
         # self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     async def connect(self, ip: str = "127.0.0.1", port: int = 9020):
         try:
@@ -1351,7 +1404,35 @@ class CommandChannel():
 
     def start(self):
         self.processing = True
-    
+        self.reset_integration()
+
+    def reset_integration(self):
+        self._vel_times = []
+        self._vel_samples = []
+
+    def integrate_translation(self, translation: np.ndarray, sample_time: float) -> np.ndarray | None:
+        """ Add a velocity sample and return the displacement over the window once it is full, None otherwise.
+
+        Uses the trapezium rule on the samples' actual timestamps, so dropped or irregular messages are handled.
+        The displacement has the velocity unit times seconds, i.e. cm for cm/s.
+        """
+        if self._vel_times and sample_time - self._vel_times[-1] > self.max_sample_gap:
+            # Don't integrate over a pause in the message stream
+            self.logger.debug(f"Gap of {sample_time - self._vel_times[-1]:.2f}s in motion commands, restarting window")
+            self.reset_integration()
+        self._vel_times.append(sample_time)
+        self._vel_samples.append(translation)
+        if sample_time - self._vel_times[0] < self.integration_window:
+            return None
+        times = np.asarray(self._vel_times)
+        velocities = np.asarray(self._vel_samples)
+        dt = np.diff(times)
+        displacement = np.sum(0.5 * (velocities[1:] + velocities[:-1]) * dt[:, None], axis=0)
+        # The last sample starts the next window, so no time is lost between windows
+        self._vel_times = [self._vel_times[-1]]
+        self._vel_samples = [self._vel_samples[-1]]
+        return displacement
+
     def close(self) -> None:
         self.processing = False
         if self.simulation:
@@ -1425,8 +1506,10 @@ class CommandChannel():
         Expected format: rotation_x,rotation_y,rotation_z,translation_x,translation_y,translation_z,target
         Where target: 0 = gimbal, 1 = drone
 
-        Returns: dict with keys 'rotation', 'translation', 'target' or None if parsing fails
+        Returns: dict with keys 'rotation', 'translation', 'target', 'target_flag' and 'displacement' or None if
+        parsing fails. 'displacement' is the integrated translation in cm once per integration window, None otherwise.
         """
+        sample_time = time.monotonic()
         try:
             # Clean the message (remove newlines and extra whitespace)
             message = message.strip()
@@ -1451,11 +1534,16 @@ class CommandChannel():
             if target_flag == 1:
                 target = 'drone'
 
+            displacement = self.integrate_translation(translation, sample_time)
+            if target_flag == -1:
+                self.reset_integration()
+
             result = {
                 'rotation': rotation,
                 'translation': translation,
                 'target': target,
-                'target_flag': target_flag
+                'target_flag': target_flag,
+                'displacement': displacement,
             }
 
             return result
